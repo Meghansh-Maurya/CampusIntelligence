@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     # AI provider. AI-dependent routes return HTTP 503 until a key is configured.
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-3.8-flash"
+    # Optional second model tried automatically when the primary model's quota is exhausted.
+    gemini_fallback_model: str | None = None
     gemini_embedding_model: str = "gemini-embedding-2"
     gemini_embedding_dimensions: int = 768
 

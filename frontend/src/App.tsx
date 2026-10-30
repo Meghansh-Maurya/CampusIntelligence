@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { FormEvent, ReactNode } from 'react'
+import type { CSSProperties, FormEvent, ReactNode } from 'react'
 import { api, apiRoot } from './services/api'
 import type {
   Analytics, Application, ChatMessage, Conversation, DocumentItem, DSARecord,
@@ -335,7 +335,7 @@ function ResumePage({ documents, analyses, busy, run }: { documents: DocumentIte
 
     {selectedAnalysis && <section className="panel analysis-result">
       <div className="analysis-score">
-        <div className="score-ring"><strong>{selectedAnalysis.resume_score}</strong><span>/100</span></div>
+        <div className="score-ring" role="img" aria-label={`Resume score ${selectedAnalysis.resume_score} out of 100`} style={{ '--pct': Math.max(0, Math.min(100, Number(selectedAnalysis.resume_score) || 0)) } as CSSProperties}><strong>{selectedAnalysis.resume_score}</strong><span>/100</span></div>
         <div>
           <div className="eyebrow">LATEST EVALUATION</div>
           <h3>{selectedAnalysis.resume_filename}</h3>
@@ -476,16 +476,58 @@ function StudyPlannerPage({ plans, documents, busy, run }: { plans: StudyPlan[];
   </>
 }
 
+const asList = (value: unknown): string[] => Array.isArray(value) ? value.map(item => String(item).trim()).filter(Boolean) : []
+const asText = (value: unknown): string => typeof value === 'string' ? value.trim() : ''
+
+function BulletBlock({ title, items, tone }: { title: string; items: string[]; tone: 'good' | 'warn' | 'info' }) {
+  if (!items.length) return null
+  return <div className={`eval-block ${tone}`}><h5>{title}</h5><ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul></div>
+}
+
+function EvaluationView({ evaluation }: { evaluation: Record<string, unknown> }) {
+  const score = Number(evaluation.score)
+  const hasScore = evaluation.score !== undefined && evaluation.score !== null && Number.isFinite(score)
+  const tone = !hasScore ? 'mid' : score >= 7 ? 'good' : score >= 4 ? 'mid' : 'low'
+  const feedback = asText(evaluation.feedback)
+  const ideal = asText(evaluation.ideal_answer)
+  return <div className="eval-view">
+    <div className="eval-head">
+      {hasScore && <span className={`eval-score ${tone}`}>{score}<small>/10</small></span>}
+      <strong>Answer evaluation</strong>
+    </div>
+    {feedback && <p className="eval-feedback">{feedback}</p>}
+    <BulletBlock title="Strengths" items={asList(evaluation.strengths)} tone="good"/>
+    <BulletBlock title="Missing concepts" items={asList(evaluation.missing_concepts)} tone="warn"/>
+    {ideal && <details className="eval-ideal"><summary>Show ideal answer</summary><p>{ideal}</p></details>}
+  </div>
+}
+
+function SummaryView({ summary }: { summary: Record<string, unknown> }) {
+  const average = Number(summary.average_score)
+  const hasAverage = summary.average_score !== undefined && summary.average_score !== null && Number.isFinite(average)
+  const overall = asText(summary.overall_feedback)
+  const tone = !hasAverage ? 'mid' : average >= 7 ? 'good' : average >= 4 ? 'mid' : 'low'
+  return <div className="eval-view summary">
+    <div className="eval-head">
+      {hasAverage && <span className={`eval-score ${tone}`}>{Math.round(average * 10) / 10}<small>/10</small></span>}
+      <strong>Interview summary</strong>
+    </div>
+    {overall && <p className="eval-feedback">{overall}</p>}
+    <BulletBlock title="Strengths" items={asList(summary.strengths)} tone="good"/>
+    <BulletBlock title="Areas to improve" items={asList(summary.improvement_areas)} tone="warn"/>
+    <BulletBlock title="Next steps" items={asList(summary.next_steps)} tone="info"/>
+  </div>
+}
+
 function InterviewPage({ sessions, busy, run }: { sessions: InterviewSession[]; busy: boolean; run: (action: () => Promise<unknown>, success?: string) => Promise<void> }) {
   const [role, setRole] = useState('Python Backend Intern')
   const [skills, setSkills] = useState('Python, FastAPI, SQL')
   const [jd, setJd] = useState('')
   const [active, setActive] = useState<(InterviewSession & {turns?: InterviewTurn[]}) | null>(null)
   const [answer, setAnswer] = useState('')
-  const [evaluation, setEvaluation] = useState<Record<string, any> | null>(null)
-  const start = () => run(async () => { const result = await api.post<InterviewSession & {turns: InterviewTurn[]}>('/interviews', {role, job_description: jd || null, skill_focus: skills.split(',').map(s => s.trim()).filter(Boolean)}); setActive(result); setEvaluation(null) }, 'Mock interview started.')
-  const load = async (id: string) => { try { setActive(await api.get<InterviewSession & {turns: InterviewTurn[]}>(`/interviews/${id}`)); setEvaluation(null) } catch (e) { window.alert(messageOf(e)) } }
-  const submit = () => run(async () => { if (!active || !answer.trim()) throw new Error('Write an answer first.'); const result = await api.post<{evaluation: Record<string, any>; next_question: string}>(`/interviews/${active.id}/answers`, {answer}); setEvaluation(result.evaluation); setAnswer(''); setActive(await api.get<InterviewSession & {turns: InterviewTurn[]}>(`/interviews/${active.id}`)) }, 'Answer evaluated.')
+  const start = () => run(async () => { const result = await api.post<InterviewSession & {turns: InterviewTurn[]}>('/interviews', {role, job_description: jd || null, skill_focus: skills.split(',').map(s => s.trim()).filter(Boolean)}); setActive(result) }, 'Mock interview started.')
+  const load = async (id: string) => { try { setActive(await api.get<InterviewSession & {turns: InterviewTurn[]}>(`/interviews/${id}`)) } catch (e) { window.alert(messageOf(e)) } }
+  const submit = () => run(async () => { if (!active || !answer.trim()) throw new Error('Write an answer first.'); await api.post<{evaluation: Record<string, unknown>; next_question: string}>(`/interviews/${active.id}/answers`, {answer}); setAnswer(''); setActive(await api.get<InterviewSession & {turns: InterviewTurn[]}>(`/interviews/${active.id}`)) }, 'Answer evaluated.')
   const end = () => run(async () => { if (!active) return; const result = await api.post<InterviewSession & {turns: InterviewTurn[]}>(`/interviews/${active.id}/end`, {}); setActive(result) }, 'Interview ended and summary saved.')
   return <>
     <PageIntro eyebrow="AI MOCK INTERVIEWS" title="Interview preparation" description="Practise role-specific technical questions. Submit answers to receive a score, missing concepts, concrete feedback and a follow-up question."/>
@@ -493,7 +535,7 @@ function InterviewPage({ sessions, busy, run }: { sessions: InterviewSession[]; 
       <section className="panel"><div className="eyebrow">START A SESSION</div><h3>Configure your interview</h3><div className="form-stack"><label>Target role<input value={role} onChange={e => setRole(e.target.value)}/></label><label>Focus skills (comma separated)<input value={skills} onChange={e => setSkills(e.target.value)}/></label><label>Job description (optional)<textarea rows={4} value={jd} onChange={e => setJd(e.target.value)} placeholder="Paste the job description."/></label><button className="button primary" disabled={busy || !role.trim()} onClick={() => void start()}>{busy ? 'Starting…' : 'Start mock interview'}</button><small className="muted">Requires Gemini configured on the backend.</small></div></section>
       <section className="panel"><div className="eyebrow">PAST SESSIONS</div><h3>Interview history</h3>{sessions.map(item => <button className={`history-item ${active?.id === item.id ? 'selected' : ''}`} key={item.id} onClick={() => void load(item.id)}><strong>{item.role}</strong><small>{prettyDate(item.created_at)} · {item.status}</small></button>)}{!sessions.length && <p className="muted small-copy">Your interview sessions will appear here.</p>}</section>
     </div>
-    {active && <section className="panel interview-room"><div className="panel-heading"><div><div className="eyebrow">LIVE SESSION</div><h3>{active.role}</h3></div><span className={`tag ${active.status}`}>{active.status}</span></div><div className="transcript">{active.turns?.map(turn => <div className={`transcript-turn ${turn.role}`} key={turn.id}><small>{turn.role === 'interviewer' ? 'INTERVIEWER' : 'YOUR ANSWER'}</small><p>{turn.content}</p>{turn.role === 'candidate' && turn.evaluation && Object.keys(turn.evaluation).length > 0 && <pre>{JSON.stringify(turn.evaluation, null, 2)}</pre>}</div>)}</div>{active.status === 'active' && <><div className="answer-box"><label>Your answer<textarea rows={5} value={answer} onChange={e => setAnswer(e.target.value)} placeholder="Explain your approach, reasoning and trade-offs…"/></label><button className="button primary" disabled={busy || !answer.trim()} onClick={() => void submit()}>Submit answer</button></div><button className="button secondary" disabled={busy} onClick={() => void end()}>End interview and generate summary</button></>}{evaluation && <div className="evaluation-card"><h4>Latest feedback · {evaluation.score}/10</h4><p>{evaluation.feedback}</p><strong>Missing concepts</strong><p>{(evaluation.missing_concepts || []).join(', ') || 'None listed'}</p><strong>Ideal answer</strong><p>{evaluation.ideal_answer}</p></div>}{active.status === 'ended' && <div className="evaluation-card"><h4>Interview summary</h4><pre>{JSON.stringify(active.summary, null, 2)}</pre></div>}</section>}
+    {active && <section className="panel interview-room"><div className="panel-heading"><div><div className="eyebrow">LIVE SESSION</div><h3>{active.role}</h3></div><span className={`tag ${active.status}`}>{active.status}</span></div><div className="transcript">{active.turns?.map(turn => <div className={`transcript-turn ${turn.role}`} key={turn.id}><small>{turn.role === 'interviewer' ? 'INTERVIEWER' : 'YOUR ANSWER'}</small><p>{turn.content}</p>{turn.role === 'candidate' && turn.evaluation && Object.keys(turn.evaluation).length > 0 && <EvaluationView evaluation={turn.evaluation}/>}</div>)}</div>{active.status === 'active' && <><div className="answer-box"><label>Your answer<textarea rows={5} value={answer} onChange={e => setAnswer(e.target.value)} placeholder="Explain your approach, reasoning and trade-offs…"/></label><button className="button primary" disabled={busy || !answer.trim()} onClick={() => void submit()}>Submit answer</button></div><button className="button secondary" disabled={busy} onClick={() => void end()}>End interview and generate summary</button></>}{active.status === 'ended' && active.summary && Object.keys(active.summary).length > 0 && <SummaryView summary={active.summary}/>}</section>}
   </>
 }
 

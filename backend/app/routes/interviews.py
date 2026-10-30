@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -19,12 +20,45 @@ from app.schemas import (
 )
 from app.services.ai_service import generate_json
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 def _session_prompt_context(session: InterviewSession, max_turns: int = 14) -> str:
     transcript = session.turns[-max_turns:]
     return "\n".join(f"{turn.role.upper()}: {turn.content}" for turn in transcript)
+
+
+def _local_summary(session: InterviewSession, reason: str) -> dict:
+    """Fallback summary built from the stored per-answer evaluations when the AI provider is unavailable."""
+    scores: list[float] = []
+    strengths: list[str] = []
+    missing: list[str] = []
+    for turn in session.turns:
+        evaluation = turn.evaluation
+        if turn.role != "candidate" or not isinstance(evaluation, dict):
+            continue
+        try:
+            scores.append(float(evaluation["score"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        for key, bucket in (("strengths", strengths), ("missing_concepts", missing)):
+            items = evaluation.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    text = str(item).strip()
+                    if text and text not in bucket:
+                        bucket.append(text)
+    summary: dict = {
+        "overall_feedback": f"The AI-written summary was unavailable ({reason}), so this summary was calculated from your per-answer evaluations.",
+        "strengths": strengths[:5],
+        "improvement_areas": missing[:6],
+        "next_steps": [f"Revise: {item}" for item in missing[:3]],
+        "summary_source": "local",
+    }
+    if scores:
+        summary["average_score"] = round(sum(scores) / len(scores), 1)
+    return summary
 
 
 def _get_session(db: Session, user_id: UUID, session_id: UUID) -> InterviewSession:
@@ -142,12 +176,16 @@ def end_interview(
     if session.status == "ended":
         return session
     transcript = _session_prompt_context(session, max_turns=40)
-    result = generate_json(
-        f"Summarize this technical mock interview for role {session.role}. Transcript:\n{transcript}\n\n"
-        "Return JSON with overall_feedback (string), strengths (list), improvement_areas (list), next_steps (list), "
-        "and average_score (number 0-10 based only on available candidate evaluations).",
-        system_instruction="Give fair, specific learning feedback. This is practice feedback, not a validated hiring assessment.",
-    )
+    try:
+        result = generate_json(
+            f"Summarize this technical mock interview for role {session.role}. Transcript:\n{transcript}\n\n"
+            "Return JSON with overall_feedback (string), strengths (list), improvement_areas (list), next_steps (list), "
+            "and average_score (number 0-10 based only on available candidate evaluations).",
+            system_instruction="Give fair, specific learning feedback. This is practice feedback, not a validated hiring assessment.",
+        )
+    except HTTPException as exc:
+        logger.warning("AI summary unavailable (HTTP %s); using a locally computed summary.", exc.status_code)
+        result = _local_summary(session, f"AI provider error {exc.status_code}")
     if isinstance(result, dict):
         session.summary = result
     else:
