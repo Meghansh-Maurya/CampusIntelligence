@@ -1,0 +1,38 @@
+services:
+  database:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+      POSTGRES_DB: ${DB_NAME:-Campus_Intelligence}
+    ports:
+      - "5432:5432"
+    volumes:
+      - campus_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-Campus_Intelligence}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  backend:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_HOST: database
+      DB_PORT: 5432
+      STORAGE_DIR: /app/storage
+    ports:
+      - "8000:8000"
+    volumes:
+      - campus_uploads:/app/storage
+    depends_on:
+      database:
+        condition: service_healthy
+
+volumes:
+  campus_postgres_data:
+  campus_uploads:
