@@ -16,6 +16,7 @@ from sqlalchemy import (
     Uuid,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 
 
 def utc_now() -> datetime:
@@ -65,6 +66,7 @@ class Document(Base):
     page_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(24), default="processing", index=True)
     extracted_text: Mapped[str] = mapped_column(Text, default="")
+    extraction_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     owner: Mapped[User] = relationship(back_populates="documents")
@@ -80,9 +82,8 @@ class DocumentChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer)
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     text_content: Mapped[str] = mapped_column(Text)
-    # JSON embeddings keep first-time local setup simple. For high-volume production,
-    # migrate this column to pgvector and perform similarity search in PostgreSQL.
-    embedding: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
+    # Must match GEMINI_EMBEDDING_DIMENSIONS and migration 0002.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(768), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     document: Mapped[Document] = relationship(back_populates="chunks")

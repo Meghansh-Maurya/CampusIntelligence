@@ -14,7 +14,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models import Document, User
 from app.schemas import DocumentRead
-from app.services.document_service import extract_pdf_pages, index_document_chunks, make_page_chunks, save_document_file
+from app.services.document_service import extract_pdf_pages_with_metadata, index_document_chunks, make_page_chunks, save_document_file
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -56,7 +56,7 @@ def upload_document(
 
     stored_filename, path = save_document_file(contents)
     try:
-        pages = extract_pdf_pages(path)
+        pages, extraction_metadata = extract_pdf_pages_with_metadata(path)
         extracted_text = "\n\n".join(f"[Page {page_number}]\n{text}" for page_number, text in pages if text)
         chunks = make_page_chunks(pages)
         document = Document(
@@ -70,6 +70,7 @@ def upload_document(
             page_count=len(pages),
             status="processing",
             extracted_text=extracted_text,
+            extraction_metadata=extraction_metadata,
         )
         db.add(document)
         db.commit()
@@ -94,16 +95,19 @@ def upload_document(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
         db.rollback()
-        # The first insert may already have committed before chunk indexing. Remove the partial record.
-        try:
-            if "document" in locals():
+        # The document row and extracted text were committed before chunk indexing.
+        # Preserve the source file and document so it can still be accessed/reindexed.
+        if "document" in locals():
+            try:
                 existing = db.get(Document, document.id)
                 if existing is not None:
-                    db.delete(existing)
+                    existing.status = "ready"
                     db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("Could not remove partial document record")
+                    db.refresh(existing)
+                    logger.exception("Chunk indexing failed for %s; preserving document for recovery.", existing.id)
+                    return existing
+            except Exception:
+                db.rollback()
         path.unlink(missing_ok=True)
         logger.exception("Failed to process an uploaded document")
         raise HTTPException(status_code=500, detail="The document could not be processed. Check backend logs.")

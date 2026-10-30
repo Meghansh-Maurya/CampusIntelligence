@@ -1,224 +1,105 @@
-
 from __future__ import annotations
-
-import logging
-import re
-import uuid
+import logging, re, uuid
 from pathlib import Path
-
 import pymupdf as fitz
 from sqlalchemy.orm import Session
-
 from app.core.config import settings
 from app.models import Document, DocumentChunk
 from app.services.ai_service import ai_is_configured, embed_texts
 
 logger = logging.getLogger(__name__)
+EMBEDDING_BATCH_SIZE = 8
+_OCR_ENGINE = None
 
-EMBEDDING_BATCH_SIZE = 32
-
-
-def split_text(
-    text: str,
-    chunk_size: int = 1200,
-    overlap: int = 180,
-) -> list[str]:
-    """Small, dependency-free overlapping chunker used by the RAG baseline."""
-    clean = re.sub(r"\s+", " ", text).strip()
-
-    if not clean:
-        return []
-
-    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
-        raise ValueError(
-            "chunk_size must be positive and overlap must be smaller than chunk_size."
-        )
-
-    chunks: list[str] = []
-    start = 0
-
+def split_text(text: str, chunk_size: int = 1200, overlap: int = 180) -> list[str]:
+    clean = re.sub(r"\\s+", " ", text).strip()
+    if not clean: return []
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size: raise ValueError("Invalid chunk size/overlap.")
+    chunks, start = [], 0
     while start < len(clean):
         end = min(start + chunk_size, len(clean))
-
         if end < len(clean):
-            boundary = clean.rfind(
-                " ",
-                start + int(chunk_size * 0.65),
-                end,
-            )
-
-            if boundary > start:
-                end = boundary
-
+            boundary = clean.rfind(" ", start + int(chunk_size * .65), end)
+            if boundary > start: end = boundary
         piece = clean[start:end].strip()
-
-        if piece:
-            chunks.append(piece)
-
-        if end >= len(clean):
-            break
-
+        if piece: chunks.append(piece)
+        if end >= len(clean): break
         start = max(end - overlap, start + 1)
-
     return chunks
 
+def _ocr_image(image_bytes: bytes) -> tuple[str, float | None]:
+    global _OCR_ENGINE
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as exc:
+        raise ValueError("Scanned PDF detected. Install rapidocr-onnxruntime from backend requirements.txt to enable OCR.") from exc
+    if _OCR_ENGINE is None: _OCR_ENGINE = RapidOCR()
+    result, _ = _OCR_ENGINE(image_bytes)
+    if not result: return "", None
+    lines, scores = [], []
+    for item in result:
+        if len(item) >= 3 and str(item[1]).strip():
+            lines.append(str(item[1]).strip())
+            try: scores.append(float(item[2]))
+            except (TypeError, ValueError): pass
+    return "\\n".join(lines), (sum(scores) / len(scores) if scores else None)
 
-def extract_pdf_pages(file_path: Path) -> list[tuple[int, str]]:
-    """Extract (one-based page number, text) from a PDF; scanned PDFs need OCR."""
+def extract_pdf_pages_with_metadata(file_path: Path) -> tuple[list[tuple[int, str]], dict]:
+    pages, ocr_pages, confidence = [], [], {}
     try:
         with fitz.open(file_path) as pdf:
-            if len(pdf) > settings.max_pdf_pages:
-                raise ValueError(
-                    f"PDF exceeds the configured limit of "
-                    f"{settings.max_pdf_pages} pages."
-                )
+            if len(pdf) > settings.max_pdf_pages: raise ValueError(f"PDF exceeds {settings.max_pdf_pages} pages.")
+            if pdf.is_encrypted: raise ValueError("Password-protected PDFs are not supported.")
+            for i, page in enumerate(pdf):
+                native = page.get_text("text").strip()
+                compact = re.sub(r"\\s+", "", native)
+                usable = len(compact) >= 35 and sum(c.isalnum() for c in compact) / max(len(compact), 1) >= .35
+                text = native
+                if not usable:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(220/72, 220/72), colorspace=fitz.csRGB, alpha=False)
+                    ocr_text, score = _ocr_image(pix.tobytes("png"))
+                    if ocr_text.strip():
+                        text = ocr_text.strip()
+                        ocr_pages.append(i + 1)
+                        if score is not None: confidence[str(i + 1)] = round(score, 4)
+                pages.append((i + 1, text))
+    except ValueError: raise
+    except Exception as exc: raise ValueError("This file could not be read as a valid PDF.") from exc
+    if not pages or not any(t.strip() for _, t in pages):
+        raise ValueError("No readable text could be extracted. The PDF may be blank, damaged, or too low-quality for OCR.")
+    return pages, {"extraction_method": "mixed" if ocr_pages and len(ocr_pages) < len(pages) else ("ocr" if ocr_pages else "native"), "ocr_pages": ocr_pages, "ocr_engine": "RapidOCR" if ocr_pages else None, "ocr_average_confidence_by_page": confidence, "page_count": len(pages)}
 
-            if pdf.is_encrypted:
-                raise ValueError(
-                    "Password-protected PDFs are not supported."
-                )
+def extract_pdf_pages(file_path: Path) -> list[tuple[int, str]]:
+    return extract_pdf_pages_with_metadata(file_path)[0]
 
-            pages = [
-                (index + 1, page.get_text("text").strip())
-                for index, page in enumerate(pdf)
-            ]
-
-    except ValueError:
-        raise
-
-    except Exception as exc:
-        raise ValueError(
-            "This file could not be read as a valid PDF."
-        ) from exc
-
-    if not pages or not any(text for _, text in pages):
-        raise ValueError(
-            "No selectable text was found. Scanned PDFs need an OCR feature, "
-            "which is not included in this version."
-        )
-
-    return pages
-
-
-def make_page_chunks(
-    pages: list[tuple[int, str]],
-) -> list[tuple[int, int, str]]:
-    result: list[tuple[int, int, str]] = []
-    chunk_index = 0
-
-    for page_number, page_text in pages:
-        for part in split_text(page_text):
-            result.append(
-                (chunk_index, page_number, part)
-            )
-            chunk_index += 1
-
-    return result
-
+def make_page_chunks(pages: list[tuple[int, str]]) -> list[tuple[int, int, str]]:
+    out, idx = [], 0
+    for page, text in pages:
+        for part in split_text(text):
+            out.append((idx, page, part)); idx += 1
+    return out
 
 def save_document_file(contents: bytes) -> tuple[str, Path]:
-    settings.storage_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    stored_filename = f"{uuid.uuid4().hex}.pdf"
-    path = settings.storage_dir / stored_filename
-
+    settings.storage_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{uuid.uuid4().hex}.pdf"
+    path = settings.storage_dir / name
     path.write_bytes(contents)
+    return name, path
 
-    return stored_filename, path
-
-
-def index_document_chunks(
-    db: Session,
-    document: Document,
-    chunks: list[tuple[int, int, str]],
-) -> None:
-    """
-    Index document chunks.
-
-    If Gemini embedding generation fails for a batch, the corresponding
-    chunks are still saved with embedding=None. Other batches continue.
-    """
-    if not chunks:
-        logger.info(
-            "Document %s contains no chunks to index.",
-            document.id,
-        )
-        return
-
+def index_document_chunks(db: Session, document: Document, chunks: list[tuple[int, int, str]]) -> None:
     vectors: list[list[float] | None] = [None] * len(chunks)
-
     if ai_is_configured():
-        total_batches = (
-            len(chunks) + EMBEDDING_BATCH_SIZE - 1
-        ) // EMBEDDING_BATCH_SIZE
-
-        successful_chunks = 0
-        failed_chunks = 0
-
-        for batch_number, start in enumerate(
-            range(0, len(chunks), EMBEDDING_BATCH_SIZE),
-            start=1,
-        ):
-            batch = chunks[
-                start : start + EMBEDDING_BATCH_SIZE
-            ]
-
+        for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+            batch = chunks[start:start + EMBEDDING_BATCH_SIZE]
             try:
-                embeddings = embed_texts(
-                    [chunk[2] for chunk in batch]
-                )
-
-                vectors[start : start + len(batch)] = embeddings
-                successful_chunks += len(batch)
-
-                logger.info(
-                    "Embedded batch %s/%s for document %s (%s chunks).",
-                    batch_number,
-                    total_batches,
-                    document.id,
-                    len(batch),
-                )
-
+                embedded = embed_texts([x[2] for x in batch], task_type="RETRIEVAL_DOCUMENT")
+                if any(len(v) != settings.gemini_embedding_dimensions for v in embedded):
+                    raise ValueError("Embedding dimension mismatch.")
+                vectors[start:start + len(batch)] = embedded
             except Exception:
-                failed_chunks += len(batch)
-
-                logger.exception(
-                    "Embedding failed for batch %s/%s of document %s. "
-                    "Saving these chunks without vectors; lexical retrieval "
-                    "will remain available.",
-                    batch_number,
-                    total_batches,
-                    document.id,
-                )
-
-        logger.info(
-            "Document %s embedding summary: %s successful, %s failed, "
-            "%s total chunks.",
-            document.id,
-            successful_chunks,
-            failed_chunks,
-            len(chunks),
-        )
-
+                logger.exception("Embedding batch failed for document %s; retaining lexical chunks.", document.id)
     else:
-        logger.warning(
-            "Gemini is not configured. Document %s will be indexed "
-            "without vector embeddings.",
-            document.id,
-        )
-
+        logger.warning("Gemini unavailable; document %s will use lexical retrieval.", document.id)
     for item, vector in zip(chunks, vectors, strict=True):
-        chunk_index, page_number, content = item
-
-        db.add(
-            DocumentChunk(
-                document_id=document.id,
-                chunk_index=chunk_index,
-                page_number=page_number,
-                text_content=content,
-                embedding=vector,
-            )
-        )
+        idx, page, content = item
+        db.add(DocumentChunk(document_id=document.id, chunk_index=idx, page_number=page, text_content=content, embedding=vector))
